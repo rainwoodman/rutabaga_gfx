@@ -56,12 +56,24 @@ impl Kumquat {
                         KumquatConnection::GpuConnection(ref mut gpu_conn) => {
                             if event.readable {
                                 if let Some(ref mut kumquat_gpu) = self.kumquat_gpu_opt {
-                                    hung_up =
-                                        !gpu_conn.process_command(kumquat_gpu)? && event.hung_up;
+                                    match gpu_conn.process_command(kumquat_gpu) {
+                                        Ok(cmd_hung_up) => {
+                                            hung_up = cmd_hung_up;
+                                        }
+                                        Err(e) => {
+                                            log::warn!("kumquat gpu connection closed with error: {:?}", e);
+                                            hung_up = true;
+                                        }
+                                    }
                                 }
+                            } else if event.hung_up {
+                                hung_up = true;
                             }
 
                             if hung_up {
+                                if let Some(ref mut kumquat_gpu) = self.kumquat_gpu_opt {
+                                    gpu_conn.cleanup(kumquat_gpu);
+                                }
                                 self.wait_ctx.delete(gpu_conn.as_borrowed_descriptor())?;
                                 o.remove_entry();
                             }
@@ -142,3 +154,131 @@ impl KumquatBuilder {
         })
     }
 }
+
+#[cfg(all(test, unix))]
+mod tests {
+    use magma_gpu::protocols::ipc::KumquatStream;
+    use magma_gpu::protocols::kumquat_gpu_protocol::*;
+    use magma_gpu::util::Tube;
+    use magma_gpu::util::TubeType;
+    use rutabaga_gfx::RUTABAGA_CAPSET_CROSS_DOMAIN;
+
+    use super::*;
+
+    #[test]
+    fn client_error_and_disconnect_isolated_and_cleans_up_resources() {
+        let sock_path = std::env::temp_dir()
+            .join(format!("kumquat-test-{}.sock", std::process::id()))
+            .to_string_lossy()
+            .into_owned();
+
+        let mut server = KumquatBuilder::new()
+            .set_capset_names("cross-domain".to_string())
+            .set_gpu_socket(Some(sock_path.clone()))
+            .set_renderer_features("SystemBlob:enabled".to_string())
+            .build()
+            .unwrap();
+
+        let mut client1 = KumquatStream::new(Tube::new(&sock_path, TubeType::Packet).unwrap());
+        server.run().unwrap();
+        assert_eq!(server.connections.len(), 2);
+
+        // Create a cross-domain context
+        client1
+            .write(KumquatGpuProtocolWrite::Cmd(
+                kumquat_gpu_protocol_ctx_create {
+                    hdr: kumquat_gpu_protocol_ctrl_hdr {
+                        type_: KUMQUAT_GPU_PROTOCOL_CTX_CREATE,
+                        payload: 0,
+                    },
+                    nlen: 0,
+                    context_init: RUTABAGA_CAPSET_CROSS_DOMAIN,
+                    debug_name: [0; 64],
+                },
+            ))
+            .unwrap();
+        server.run().unwrap();
+        let resp = client1.read().unwrap();
+        let ctx_id = match resp.as_slice() {
+            [KumquatGpuProtocol::RespContextCreate(id)] => *id,
+            other => panic!("expected RespContextCreate, got {other:?}"),
+        };
+
+        // Create a 3D resource attached to ctx_id
+        client1
+            .write(KumquatGpuProtocolWrite::Cmd(
+                kumquat_gpu_protocol_resource_create_3d {
+                    hdr: kumquat_gpu_protocol_ctrl_hdr {
+                        type_: KUMQUAT_GPU_PROTOCOL_RESOURCE_CREATE_3D,
+                        payload: 0,
+                    },
+                    target: 2,
+                    format: 1,
+                    bind: 2,
+                    width: 64,
+                    height: 4,
+                    depth: 1,
+                    array_size: 1,
+                    last_level: 0,
+                    nr_samples: 0,
+                    flags: 0,
+                    size: 4096,
+                    stride: 256,
+                    ctx_id,
+                },
+            ))
+            .unwrap();
+        server.run().unwrap();
+        let _ = client1.read().unwrap();
+        assert_eq!(
+            server.kumquat_gpu_opt.as_ref().unwrap().resources.len(),
+            1
+        );
+
+        // Drop client1 abruptly without detaching the resource or destroying the context
+        drop(client1);
+        server.run().unwrap();
+
+        // Connection is removed and its attached resource/context are cleaned up
+        assert_eq!(server.connections.len(), 1);
+        assert!(server.kumquat_gpu_opt.as_ref().unwrap().resources.is_empty());
+
+        // Server remains healthy and accepts a new client connection
+        let mut client2 = KumquatStream::new(Tube::new(&sock_path, TubeType::Packet).unwrap());
+        server.run().unwrap();
+        client2
+            .write(KumquatGpuProtocolWrite::Cmd(
+                kumquat_gpu_protocol_ctrl_hdr {
+                    type_: KUMQUAT_GPU_PROTOCOL_GET_NUM_CAPSETS,
+                    payload: 0,
+                },
+            ))
+            .unwrap();
+        server.run().unwrap();
+        let resp2 = client2.read().unwrap();
+        assert!(matches!(
+            resp2.as_slice(),
+            [KumquatGpuProtocol::RespNumCapsets(1)]
+        ));
+
+        // Sending a command that errors in process_command() (detaching a non-existent resource)
+        // also isolates the error to client2 without failing server.run().
+        client2
+            .write(KumquatGpuProtocolWrite::Cmd(
+                kumquat_gpu_protocol_ctx_resource {
+                    hdr: kumquat_gpu_protocol_ctrl_hdr {
+                        type_: KUMQUAT_GPU_PROTOCOL_CTX_DETACH_RESOURCE,
+                        payload: 0,
+                    },
+                    ctx_id: 999,
+                    resource_id: 999,
+                },
+            ))
+            .unwrap();
+        server.run().unwrap();
+        assert_eq!(server.connections.len(), 1);
+
+        let _ = std::fs::remove_file(&sock_path);
+    }
+}
+

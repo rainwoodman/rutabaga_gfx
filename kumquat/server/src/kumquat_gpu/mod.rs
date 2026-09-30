@@ -70,6 +70,7 @@ pub type KumquatGpuResult<T> = std::result::Result<T, KumquatGpuError>;
 
 pub struct KumquatGpuConnection {
     stream: KumquatStream,
+    contexts: Set<u32>,
 }
 
 pub struct KumquatGpuResource {
@@ -103,7 +104,7 @@ pub struct KumquatGpu {
     rutabaga: Rutabaga,
     fence_state: FenceState,
     id_allocator: u32,
-    resources: Map<u32, KumquatGpuResource>,
+    pub(crate) resources: Map<u32, KumquatGpuResource>,
 }
 
 impl KumquatGpu {
@@ -119,6 +120,7 @@ impl KumquatGpu {
 
         let fence_handler = create_fence_handler(fence_state.clone());
 
+        let use_system_blob = renderer_features.contains("SystemBlob:enabled");
         let renderer_features_opt = if renderer_features.is_empty() {
             None
         } else {
@@ -129,7 +131,7 @@ impl KumquatGpu {
             .set_use_external_blob(true)
             // Metal cannot export device memory, so host visible memory is
             // shared memory the host imports as a host pointer instead.
-            .set_use_system_blob(cfg!(target_vendor = "apple"))
+            .set_use_system_blob(cfg!(target_vendor = "apple") || use_system_blob)
             .set_use_egl(true)
             .set_wsi(RutabagaWsi::Surfaceless)
             .set_renderer_features(renderer_features_opt)
@@ -147,12 +149,54 @@ impl KumquatGpu {
         self.id_allocator += 1;
         self.id_allocator
     }
+
+    pub fn detach_and_release_resource(&mut self, ctx_id: u32, resource_id: u32) -> KumquatGpuResult<()> {
+        let _ = self.rutabaga.context_detach_resource(ctx_id, resource_id);
+
+        let mut resource = self
+            .resources
+            .remove(&resource_id)
+            .ok_or(RutabagaError::InvalidResourceId)?;
+
+        resource.attached_contexts.remove(&ctx_id);
+        if resource.attached_contexts.is_empty() {
+            if resource.mapping.is_some() {
+                self.rutabaga.detach_backing(resource_id)?;
+            }
+
+            self.rutabaga.unref_resource(resource_id)?;
+        } else {
+            self.resources.insert(resource_id, resource);
+        }
+        Ok(())
+    }
+
+    pub fn destroy_context(&mut self, ctx_id: u32) -> KumquatGpuResult<()> {
+        let attached_resources: Vec<u32> = self
+            .resources
+            .iter()
+            .filter_map(|(&res_id, res)| res.attached_contexts.contains(&ctx_id).then_some(res_id))
+            .collect();
+        for res_id in attached_resources {
+            let _ = self.detach_and_release_resource(ctx_id, res_id);
+        }
+        self.rutabaga.destroy_context(ctx_id)?;
+        Ok(())
+    }
 }
 
 impl KumquatGpuConnection {
     pub fn new(connection: Tube) -> KumquatGpuConnection {
         KumquatGpuConnection {
             stream: KumquatStream::new(connection),
+            contexts: Set::new(),
+        }
+    }
+
+    pub fn cleanup(&mut self, kumquat_gpu: &mut KumquatGpu) {
+        let contexts = std::mem::take(&mut self.contexts);
+        for ctx_id in contexts {
+            let _ = kumquat_gpu.destroy_context(ctx_id);
         }
     }
 
@@ -213,6 +257,7 @@ impl KumquatGpuConnection {
                         cmd.context_init,
                         context_name.as_deref(),
                     )?;
+                    self.contexts.insert(context_id);
 
                     let resp = kumquat_gpu_protocol_ctrl_hdr {
                         type_: KUMQUAT_GPU_PROTOCOL_RESP_CONTEXT_CREATE,
@@ -222,33 +267,19 @@ impl KumquatGpuConnection {
                     self.stream.write(KumquatGpuProtocolWrite::Cmd(resp))?;
                 }
                 KumquatGpuProtocol::CtxDestroy(ctx_id) => {
-                    kumquat_gpu.rutabaga.destroy_context(ctx_id)?;
+                    self.contexts.remove(&ctx_id);
+                    kumquat_gpu.destroy_context(ctx_id)?;
                 }
                 KumquatGpuProtocol::CtxAttachResource(cmd) => {
                     kumquat_gpu
                         .rutabaga
                         .context_attach_resource(cmd.ctx_id, cmd.resource_id)?;
+                    if let Some(resource) = kumquat_gpu.resources.get_mut(&cmd.resource_id) {
+                        resource.attached_contexts.insert(cmd.ctx_id);
+                    }
                 }
                 KumquatGpuProtocol::CtxDetachResource(cmd) => {
-                    kumquat_gpu
-                        .rutabaga
-                        .context_detach_resource(cmd.ctx_id, cmd.resource_id)?;
-
-                    let mut resource = kumquat_gpu
-                        .resources
-                        .remove(&cmd.resource_id)
-                        .ok_or(RutabagaError::InvalidResourceId)?;
-
-                    resource.attached_contexts.remove(&cmd.ctx_id);
-                    if resource.attached_contexts.is_empty() {
-                        if resource.mapping.is_some() {
-                            kumquat_gpu.rutabaga.detach_backing(cmd.resource_id)?;
-                        }
-
-                        kumquat_gpu.rutabaga.unref_resource(cmd.resource_id)?;
-                    } else {
-                        kumquat_gpu.resources.insert(cmd.resource_id, resource);
-                    }
+                    kumquat_gpu.detach_and_release_resource(cmd.ctx_id, cmd.resource_id)?;
                 }
                 KumquatGpuProtocol::ResourceCreate3d(cmd) => {
                     let resource_create_3d = ResourceCreate3D {
@@ -293,7 +324,7 @@ impl KumquatGpuConnection {
                     kumquat_gpu.resources.insert(
                         resource_id,
                         KumquatGpuResource {
-                            attached_contexts: Default::default(),
+                            attached_contexts: Set::from([cmd.ctx_id]),
                             mapping: Some(mapping),
                         },
                     );
